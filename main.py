@@ -54,9 +54,7 @@ def get_mounts() -> Dict[str, List[str]]:
                                 device = str(resolved)
                         except OSError:
                             pass
-                    if device not in mounts:
-                        mounts[device] = []
-                    mounts[device].append(mountpoint)
+                    mounts.setdefault(device, []).append(mountpoint)
     except OSError:
         pass
     return mounts
@@ -66,7 +64,7 @@ def get_device_slaves(dev_path: Path) -> List[str]:
     slaves: List[str] = []
     slaves_path = dev_path / "slaves"
     if slaves_path.exists():
-        for slave in slaves_path.iterdir():
+        for slave in sorted(slaves_path.iterdir(), key=lambda p: p.name):
             if slave.is_dir():
                 slaves.append(slave.name)
     return slaves
@@ -143,7 +141,7 @@ def build_topology(devices: Dict[str, Any]) -> List[Dict[str, Any]]:
                     dev_info["parent"] = candidate
                     break
     
-    for dev_name, dev_info in devices.items():
+    for dev_info in devices.values():
         if dev_info["parent"]:
             continue
         for slave_name in dev_info["slaves"]:
@@ -181,36 +179,39 @@ def get_mount_string(mounts: Dict[str, List[str]], dev_name: str) -> str:
     return ""
 
 
-def format_tree(devices: List[Dict[str, Any]], mounts: Dict[str, List[str]], prefix: str = "", is_last: bool = True) -> List[str]:
+def format_tree(devices: List[Dict[str, Any]], mounts: Dict[str, List[str]], prefix: str = "") -> List[str]:
     lines: List[str] = []
     
     for idx, dev in enumerate(devices):
-        is_last_child = (idx == len(devices) - 1)
-        current_prefix = prefix + ("└─" if is_last_child else "├─") if prefix else ""
+        is_last = (idx == len(devices) - 1)
+        
+        if prefix:
+            connector = "└─" if is_last else "├─"
+            display_name = f"{prefix}{connector}{dev['name']}"
+        else:
+            display_name = dev["name"]
         
         mountpoint = get_mount_string(mounts, dev["name"])
         
         rm_flag = "1" if dev.get("rm", False) else "0"
         ro_flag = "1" if dev.get("ro", False) else "0"
         
-        name_display = dev["name"]
-        name_width = 16 - len(current_prefix)
-        if name_width < 1:
-            name_width = 1
-        
-        line = f"{current_prefix}{name_display:<{name_width}} {dev['size']:<8} {dev['type']:<8} {ro_flag:<2} {rm_flag:<2} {mountpoint}"
+        line = f"{display_name:<24} {dev['size']:<8} {dev['type']:<8} {ro_flag:<2} {rm_flag:<2} {mountpoint}"
         lines.append(line.rstrip())
         
         if dev.get("children"):
-            child_prefix = prefix + ("    " if is_last_child else "│   ")
-            child_lines = format_tree(dev["children"], mounts, child_prefix, is_last_child)
+            if prefix:
+                child_prefix = prefix + ("    " if is_last else "│   ")
+            else:
+                child_prefix = "    " if is_last else "│   "
+            child_lines = format_tree(dev["children"], mounts, child_prefix)
             lines.extend(child_lines)
     
     return lines
 
 
 def print_tree(devices: List[Dict[str, Any]], mounts: Dict[str, List[str]]) -> None:
-    print(f"{'NAME':<16} {'SIZE':<8} {'TYPE':<8} {'RO':<2} {'RM':<2} MOUNTPOINT")
+    print(f"{'NAME':<24} {'SIZE':<8} {'TYPE':<8} {'RO':<2} {'RM':<2} MOUNTPOINT")
     lines = format_tree(devices, mounts)
     for line in lines:
         print(line)
