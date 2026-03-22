@@ -72,16 +72,6 @@ def get_device_slaves(dev_path: Path) -> List[str]:
     return slaves
 
 
-def get_device_holders(dev_path: Path) -> List[str]:
-    holders: List[str] = []
-    holders_path = dev_path / "holders"
-    if holders_path.exists():
-        for holder in holders_path.iterdir():
-            if holder.is_dir():
-                holders.append(holder.name)
-    return holders
-
-
 def device_size_bytes(dev_path: Path) -> int:
     sectors = read_int(dev_path / "size", 0)
     return sectors * 512
@@ -99,29 +89,13 @@ def get_device_type(dev_path: Path) -> str:
     return "disk"
 
 
-def get_parent_from_sysfs(dev_name: str, dev_path: Path) -> str:
+def get_parent_from_sysfs(dev_name: str) -> str:
+    dev_path = SYS_BLOCK / dev_name
+    
     if not (dev_path / "partition").exists():
         return ""
     
     try:
-        part_file = dev_path / "partition"
-        if not part_file.exists():
-            return ""
-        
-        partition_num = read_int(part_file, 0)
-        if partition_num == 0:
-            return ""
-        
-        for parent_name in SYS_BLOCK.iterdir():
-            if not parent_name.is_dir():
-                continue
-            
-            parent_path = SYS_BLOCK / parent_name.name
-            if (parent_path / f"{parent_name.name}{partition_num}").exists():
-                return parent_name.name
-            if (parent_path / f"{parent_name.name}p{partition_num}").exists():
-                return parent_name.name
-        
         for parent_name in SYS_BLOCK.iterdir():
             if not parent_name.is_dir():
                 continue
@@ -130,8 +104,7 @@ def get_parent_from_sysfs(dev_name: str, dev_path: Path) -> str:
             for child in parent_path.iterdir():
                 if child.is_dir() and child.name == dev_name:
                     return parent_name.name
-    
-    except (OSError, ValueError):
+    except OSError:
         pass
     
     return ""
@@ -144,16 +117,14 @@ def get_device_info(dev_name: str) -> Dict[str, Any]:
         "name": dev_name,
         "size": human_size(device_size_bytes(dev_path)),
         "type": get_device_type(dev_path),
-        "model": read_text(dev_path / "device/model", ""),
         "ro": read_bool(dev_path / "ro"),
         "rm": read_bool(dev_path / "removable"),
         "slaves": get_device_slaves(dev_path),
-        "holders": get_device_holders(dev_path),
         "children": [],
         "parent": "",
     }
     
-    parent = get_parent_from_sysfs(dev_name, dev_path)
+    parent = get_parent_from_sysfs(dev_name)
     if parent:
         info["parent"] = parent
     
@@ -161,6 +132,9 @@ def get_device_info(dev_name: str) -> Dict[str, Any]:
 
 
 def build_topology(devices: Dict[str, Any]) -> List[Dict[str, Any]]:
+    for dev_info in devices.values():
+        dev_info["children"] = []
+    
     for dev_name, dev_info in devices.items():
         if dev_info["type"] == "part" and not dev_info["parent"]:
             for candidate in devices:
@@ -170,26 +144,24 @@ def build_topology(devices: Dict[str, Any]) -> List[Dict[str, Any]]:
                     break
     
     for dev_name, dev_info in devices.items():
+        if dev_info["parent"]:
+            continue
         for slave_name in dev_info["slaves"]:
             if slave_name in devices:
-                if not devices[slave_name].get("parent"):
-                    devices[slave_name]["parent"] = dev_name
-    
-    for dev_name, dev_info in devices.items():
-        if dev_info["parent"] and dev_info["parent"] in devices:
-            devices[dev_info["parent"]]["children"].append(dev_info)
-    
-    roots: List[Dict[str, Any]] = []
-    for dev_name, dev_info in devices.items():
-        if not dev_info["parent"] or dev_info["parent"] not in devices:
-            roots.append(dev_info)
+                dev_info["parent"] = slave_name
+                break
     
     for dev_info in devices.values():
-        if dev_info["children"]:
-            dev_info["children"].sort(key=lambda x: x["name"])
+        parent = dev_info.get("parent")
+        if parent and parent in devices:
+            devices[parent]["children"].append(dev_info)
+    
+    roots = [dev_info for dev_info in devices.values() if not dev_info.get("parent") or dev_info["parent"] not in devices]
+    
+    for dev_info in devices.values():
+        dev_info["children"].sort(key=lambda x: x["name"])
     
     roots.sort(key=lambda x: x["name"])
-    
     return roots
 
 
