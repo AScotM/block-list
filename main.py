@@ -4,9 +4,9 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Iterator
-from dataclasses import dataclass, field, asdict
-from functools import lru_cache
+from typing import Dict, List, Any, Optional, Iterator, Tuple
+from dataclasses import dataclass, field
+from copy import deepcopy
 
 SYS_BLOCK = Path("/sys/block")
 PROC_MOUNTS = Path("/proc/mounts")
@@ -46,21 +46,37 @@ class Device:
         if self.rm:
             flags.append("rm")
         return ",".join(flags) if flags else "-"
+    
+    def copy(self) -> 'Device':
+        new = Device(
+            name=self.name,
+            size=self.size,
+            type=self.type,
+            ro=self.ro,
+            rm=self.rm,
+            model=self.model,
+            label=self.label,
+            uuid=self.uuid,
+            parent=self.parent,
+            slaves=self.slaves.copy(),
+            children=[c.copy() for c in self.children]
+        )
+        return new
 
 
 class BlockDeviceScanner:
     def __init__(self, exclude_patterns: List[str] = None):
         self.exclude_patterns = exclude_patterns or ["loop", "ram"]
-        self._devices: Dict[str, Device] = {}
     
     def scan(self) -> Dict[str, Device]:
+        devices: Dict[str, Device] = {}
         for dev_name in self._iter_block_devices():
             if self._should_exclude(dev_name):
                 continue
-            self._devices[dev_name] = self._read_device(dev_name)
+            devices[dev_name] = self._read_device(dev_name)
         
-        self._build_relationships()
-        return self._devices
+        self._build_relationships(devices)
+        return devices
     
     def _iter_block_devices(self) -> Iterator[str]:
         try:
@@ -75,13 +91,17 @@ class BlockDeviceScanner:
     
     def _read_device(self, name: str) -> Device:
         path = SYS_BLOCK / name
+        dev_path = path / "device"
+        
         return Device(
             name=name,
             size=self._read_size(path),
             type=self._read_type(path),
             ro=self._read_bool(path / "ro"),
             rm=self._read_bool(path / "removable"),
-            model=self._read_text(path / "device/model"),
+            model=self._read_text(dev_path / "model"),
+            label=self._read_partition_label(path),
+            uuid=self._read_partition_uuid(path),
             slaves=self._read_slaves(path),
         )
     
@@ -118,29 +138,39 @@ class BlockDeviceScanner:
         slaves_path = path / "slaves"
         if not slaves_path.exists():
             return []
-        return sorted(
-            s.name for s in slaves_path.iterdir() if s.is_dir()
-        )
+        return sorted(s.name for s in slaves_path.iterdir() if s.is_dir())
     
-    def _build_relationships(self) -> None:
-        for dev in self._devices.values():
+    def _read_partition_label(self, path: Path) -> str:
+        label_path = path / "label"
+        if label_path.exists():
+            return self._read_text(label_path)
+        return ""
+    
+    def _read_partition_uuid(self, path: Path) -> str:
+        uuid_path = path / "uuid"
+        if uuid_path.exists():
+            return self._read_text(uuid_path)
+        return ""
+    
+    def _build_relationships(self, devices: Dict[str, Device]) -> None:
+        for dev in devices.values():
             for slave in dev.slaves:
-                if slave in self._devices:
+                if slave in devices:
                     dev.parent = slave
                     break
         
-        for dev in self._devices.values():
+        for dev in devices.values():
             if dev.type == "part" and not dev.parent:
-                for parent in self._devices.values():
+                for parent in devices.values():
                     if (SYS_BLOCK / parent.name / dev.name).exists():
                         dev.parent = parent.name
                         break
         
-        for dev in self._devices.values():
-            if dev.parent and dev.parent in self._devices:
-                self._devices[dev.parent].children.append(dev)
+        for dev in devices.values():
+            if dev.parent and dev.parent in devices:
+                devices[dev.parent].children.append(dev)
         
-        for dev in self._devices.values():
+        for dev in devices.values():
             dev.children.sort(key=lambda d: d.name)
 
 
@@ -257,11 +287,8 @@ class JsonFormatter:
 
 
 class SimpleFormatter:
-    def __init__(self, mounts: Dict[str, List[str]]):
-        self.mounts = mounts
-    
     def format(self, devices: List[Device]) -> List[str]:
-        return [f"/dev/{d.name}" for d in devices if not d.parent]
+        return [f"/dev/{d.name}" for d in devices]
 
 
 def get_roots(devices: Dict[str, Device]) -> List[Device]:
@@ -270,33 +297,73 @@ def get_roots(devices: Dict[str, Device]) -> List[Device]:
     return roots
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="lsblk",
-        description="List block devices",
-        epilog="Examples:\n  lsblk              Show device tree\n  lsblk -o json      JSON output\n  lsblk -s 1G        Show devices >= 1GB\n  lsblk -t disk      Show only disks"
-    )
+def filter_by_size(devices: List[Device], min_size: int) -> List[Device]:
+    def filter_device(dev: Device) -> Optional[Device]:
+        if dev.size >= min_size:
+            return dev.copy()
+        
+        filtered_children = []
+        for child in dev.children:
+            filtered_child = filter_device(child)
+            if filtered_child:
+                filtered_children.append(filtered_child)
+        
+        if filtered_children:
+            new_dev = dev.copy()
+            new_dev.children = filtered_children
+            return new_dev
+        
+        return None
     
-    parser.add_argument("-o", "--output", choices=["tree", "json", "simple"], default="tree")
-    parser.add_argument("-p", "--pretty", action="store_true", help="Pretty print JSON")
-    parser.add_argument("-s", "--min-size", type=str, help="Minimum size (e.g., 1G, 500M)")
-    parser.add_argument("-t", "--type", action="append", dest="types", help="Filter by type (disk, part, dm, raid)")
-    parser.add_argument("-x", "--exclude", action="append", default=["loop", "ram"], help="Exclude devices by prefix")
-    parser.add_argument("-w", "--width", type=int, default=24, help="Name column width")
-    parser.add_argument("--no-headers", action="store_true", help="Suppress headers")
+    result = []
+    for dev in devices:
+        filtered = filter_device(dev)
+        if filtered:
+            result.append(filtered)
+    return result
+
+
+def filter_by_type(devices: List[Device], types: List[str]) -> List[Device]:
+    def filter_device(dev: Device) -> Optional[Device]:
+        if dev.type in types:
+            return dev.copy()
+        
+        filtered_children = []
+        for child in dev.children:
+            filtered_child = filter_device(child)
+            if filtered_child:
+                filtered_children.append(filtered_child)
+        
+        if filtered_children:
+            new_dev = dev.copy()
+            new_dev.children = filtered_children
+            return new_dev
+        
+        return None
     
-    return parser.parse_args()
+    result = []
+    for dev in devices:
+        filtered = filter_device(dev)
+        if filtered:
+            result.append(filtered)
+    return result
 
 
 def parse_size(size_str: str) -> int:
     if not size_str:
         return 0
     size_str = size_str.upper().strip()
-    multipliers = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-    for suffix, mult in multipliers.items():
+    suffixes: List[Tuple[str, int]] = [
+        ("T", 1024**4),
+        ("G", 1024**3),
+        ("M", 1024**2),
+        ("K", 1024),
+        ("B", 1),
+    ]
+    for suffix, multiplier in suffixes:
         if size_str.endswith(suffix):
             try:
-                return int(float(size_str[:-len(suffix)]) * mult)
+                return int(float(size_str[:-len(suffix)]) * multiplier)
             except ValueError:
                 pass
     try:
@@ -305,37 +372,27 @@ def parse_size(size_str: str) -> int:
         raise argparse.ArgumentTypeError(f"Invalid size: {size_str}")
 
 
-def filter_by_size(devices: List[Device], min_size: int) -> List[Device]:
-    def should_include(dev: Device) -> bool:
-        if dev.size >= min_size:
-            return True
-        if dev.children:
-            filtered_children = [c for c in dev.children if should_include(c)]
-            if filtered_children:
-                dev.children = filtered_children
-                return True
-        return False
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="lsblk",
+        description="List block devices",
+        epilog="Examples:\n  lsblk              Show device tree\n  lsblk --json       JSON output\n  lsblk --min 1G     Show devices >= 1GB\n  lsblk --type disk  Show only disks"
+    )
     
-    return [d for d in devices if should_include(d)]
-
-
-def filter_by_type(devices: List[Device], types: List[str]) -> List[Device]:
-    def should_include(dev: Device) -> bool:
-        if dev.type in types:
-            return True
-        if dev.children:
-            filtered_children = [c for c in dev.children if should_include(c)]
-            if filtered_children:
-                dev.children = filtered_children
-                return True
-        return False
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--simple", action="store_true", help="Simple output (device paths only)")
+    parser.add_argument("--pretty", action="store_true", help="Pretty print JSON")
+    parser.add_argument("--min", "--min-size", type=str, dest="min_size", help="Minimum size (e.g., 1G, 500M)")
+    parser.add_argument("--type", action="append", dest="types", help="Filter by type (disk, part, dm, raid)")
+    parser.add_argument("--exclude", action="append", default=["loop", "ram"], help="Exclude devices by prefix")
+    parser.add_argument("--width", type=int, default=24, help="Name column width")
+    parser.add_argument("--no-headers", action="store_true", help="Suppress headers")
     
-    return [d for d in devices if should_include(d)]
+    return parser.parse_args()
 
 
-def print_headers(formatter_type: str) -> None:
-    if formatter_type == "tree":
-        print(f"{'NAME':<24} {'SIZE':>8} {'TYPE':<6} {'FLAGS':<4} MOUNTPOINT")
+def print_headers(width: int) -> None:
+    print(f"{'NAME':<{width}} {'SIZE':>8} {'TYPE':<6} {'FLAGS':<4} MOUNTPOINT")
 
 
 def main() -> int:
@@ -356,19 +413,19 @@ def main() -> int:
     if args.types:
         roots = filter_by_type(roots, args.types)
     
-    if args.output == "json":
+    if args.json:
         formatter = JsonFormatter(mounts)
         print(formatter.format(roots, pretty=args.pretty))
         return 0
     
-    if args.output == "simple":
-        formatter = SimpleFormatter(mounts)
+    if args.simple:
+        formatter = SimpleFormatter()
         for line in formatter.format(roots):
             print(line)
         return 0
     
     if not args.no_headers:
-        print_headers("tree")
+        print_headers(args.width)
     
     formatter = TreeFormatter(mounts, width=args.width)
     for line in formatter.format(roots):
