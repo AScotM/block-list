@@ -4,9 +4,10 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Iterator, Tuple
+from typing import Dict, List, Any, Optional, Iterator, Tuple, Callable
 from dataclasses import dataclass, field
 from copy import deepcopy
+from functools import lru_cache
 
 SYS_BLOCK = Path("/sys/block")
 PROC_MOUNTS = Path("/proc/mounts")
@@ -67,8 +68,13 @@ class Device:
 class BlockDeviceScanner:
     def __init__(self, exclude_patterns: List[str] = None):
         self.exclude_patterns = exclude_patterns or ["loop", "ram"]
+        self._path_cache: Dict[Path, bool] = {}
     
     def scan(self) -> Dict[str, Device]:
+        if not SYS_BLOCK.exists():
+            print(f"Error: {SYS_BLOCK} does not exist", file=sys.stderr)
+            return {}
+        
         devices: Dict[str, Device] = {}
         for dev_name in self._iter_block_devices():
             if self._should_exclude(dev_name):
@@ -153,32 +159,48 @@ class BlockDeviceScanner:
         return ""
     
     def _build_relationships(self, devices: Dict[str, Device]) -> None:
+        parent_lookup: Dict[str, str] = {}
+        
         for dev in devices.values():
             for slave in dev.slaves:
                 if slave in devices:
-                    dev.parent = slave
+                    parent_lookup[dev.name] = slave
                     break
         
-        for dev in devices.values():
-            if dev.type == "part" and not dev.parent:
-                for parent in devices.values():
-                    if (SYS_BLOCK / parent.name / dev.name).exists():
-                        dev.parent = parent.name
-                        break
+        part_parents = self._find_partition_parents(devices)
+        parent_lookup.update(part_parents)
         
-        for dev in devices.values():
-            if dev.parent and dev.parent in devices:
-                devices[dev.parent].children.append(dev)
+        for dev_name, parent_name in parent_lookup.items():
+            if dev_name in devices and parent_name in devices:
+                devices[dev_name].parent = parent_name
+                devices[parent_name].children.append(devices[dev_name])
         
         for dev in devices.values():
             dev.children.sort(key=lambda d: d.name)
+    
+    def _find_partition_parents(self, devices: Dict[str, Device]) -> Dict[str, str]:
+        parent_map: Dict[str, str] = {}
+        path_to_parent: Dict[str, str] = {}
+        
+        for parent_name in devices:
+            parent_path = SYS_BLOCK / parent_name
+            for child_path in parent_path.iterdir():
+                if child_path.is_dir() and child_path.name in devices:
+                    if devices[child_path.name].type == "part":
+                        parent_map[child_path.name] = parent_name
+        
+        return parent_map
 
 
 class MountScanner:
     def __init__(self):
         self._mounts: Dict[str, List[str]] = {}
+        self._resolve_cache: Dict[str, str] = {}
     
     def scan(self) -> Dict[str, List[str]]:
+        if not PROC_MOUNTS.exists():
+            return {}
+        
         try:
             with PROC_MOUNTS.open() as f:
                 for line in f:
@@ -193,10 +215,17 @@ class MountScanner:
     def _resolve_device(self, device: str) -> str:
         if not device.startswith("/dev/"):
             return device
+        
+        if device in self._resolve_cache:
+            return self._resolve_cache[device]
+        
         try:
             resolved = Path(device).resolve()
-            return str(resolved) if resolved != Path(device) else device
+            result = str(resolved) if resolved != Path(device) else device
+            self._resolve_cache[device] = result
+            return result
         except OSError:
+            self._resolve_cache[device] = device
             return device
 
 
@@ -291,62 +320,36 @@ class SimpleFormatter:
         return [f"/dev/{d.name}" for d in devices]
 
 
+def filter_devices(devices: List[Device], predicate: Callable[[Device], bool]) -> List[Device]:
+    def filter_device(dev: Device) -> Optional[Device]:
+        if predicate(dev):
+            return dev.copy()
+        
+        filtered_children = []
+        for child in dev.children:
+            filtered_child = filter_device(child)
+            if filtered_child:
+                filtered_children.append(filtered_child)
+        
+        if filtered_children:
+            new_dev = dev.copy()
+            new_dev.children = filtered_children
+            return new_dev
+        
+        return None
+    
+    result = []
+    for dev in devices:
+        filtered = filter_device(dev)
+        if filtered:
+            result.append(filtered)
+    return result
+
+
 def get_roots(devices: Dict[str, Device]) -> List[Device]:
     roots = [d for d in devices.values() if not d.parent]
     roots.sort(key=lambda d: d.name)
     return roots
-
-
-def filter_by_size(devices: List[Device], min_size: int) -> List[Device]:
-    def filter_device(dev: Device) -> Optional[Device]:
-        if dev.size >= min_size:
-            return dev.copy()
-        
-        filtered_children = []
-        for child in dev.children:
-            filtered_child = filter_device(child)
-            if filtered_child:
-                filtered_children.append(filtered_child)
-        
-        if filtered_children:
-            new_dev = dev.copy()
-            new_dev.children = filtered_children
-            return new_dev
-        
-        return None
-    
-    result = []
-    for dev in devices:
-        filtered = filter_device(dev)
-        if filtered:
-            result.append(filtered)
-    return result
-
-
-def filter_by_type(devices: List[Device], types: List[str]) -> List[Device]:
-    def filter_device(dev: Device) -> Optional[Device]:
-        if dev.type in types:
-            return dev.copy()
-        
-        filtered_children = []
-        for child in dev.children:
-            filtered_child = filter_device(child)
-            if filtered_child:
-                filtered_children.append(filtered_child)
-        
-        if filtered_children:
-            new_dev = dev.copy()
-            new_dev.children = filtered_children
-            return new_dev
-        
-        return None
-    
-    result = []
-    for dev in devices:
-        filtered = filter_device(dev)
-        if filtered:
-            result.append(filtered)
-    return result
 
 
 def parse_size(size_str: str) -> int:
@@ -398,8 +401,16 @@ def print_headers(width: int) -> None:
 def main() -> int:
     args = parse_args()
     
+    if not SYS_BLOCK.exists():
+        print(f"Error: {SYS_BLOCK} does not exist", file=sys.stderr)
+        return 1
+    
     scanner = BlockDeviceScanner(exclude_patterns=args.exclude)
     devices = scanner.scan()
+    
+    if not devices:
+        print("No block devices found", file=sys.stderr)
+        return 1
     
     mount_scanner = MountScanner()
     mounts = mount_scanner.scan()
@@ -408,10 +419,10 @@ def main() -> int:
     
     if args.min_size:
         min_bytes = parse_size(args.min_size)
-        roots = filter_by_size(roots, min_bytes)
+        roots = filter_devices(roots, lambda d: d.size >= min_bytes)
     
     if args.types:
-        roots = filter_by_type(roots, args.types)
+        roots = filter_devices(roots, lambda d: d.type in args.types)
     
     if args.json:
         formatter = JsonFormatter(mounts)
