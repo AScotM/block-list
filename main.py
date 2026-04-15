@@ -6,8 +6,6 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Iterator, Tuple, Callable
 from dataclasses import dataclass, field
-from copy import deepcopy
-from functools import lru_cache
 
 SYS_BLOCK = Path("/sys/block")
 PROC_MOUNTS = Path("/proc/mounts")
@@ -24,6 +22,7 @@ class Device:
     label: str = ""
     uuid: str = ""
     parent: str = ""
+    holders: List[str] = field(default_factory=list)
     slaves: List[str] = field(default_factory=list)
     children: List['Device'] = field(default_factory=list)
     
@@ -59,6 +58,7 @@ class Device:
             label=self.label,
             uuid=self.uuid,
             parent=self.parent,
+            holders=self.holders.copy(),
             slaves=self.slaves.copy(),
             children=[c.copy() for c in self.children]
         )
@@ -108,6 +108,7 @@ class BlockDeviceScanner:
             model=self._read_text(dev_path / "model"),
             label=self._read_partition_label(path),
             uuid=self._read_partition_uuid(path),
+            holders=self._read_holders(path),
             slaves=self._read_slaves(path),
         )
     
@@ -140,6 +141,12 @@ class BlockDeviceScanner:
     def _read_bool(self, path: Path) -> bool:
         return self._read_text(path) == "1"
     
+    def _read_holders(self, path: Path) -> List[str]:
+        holders_path = path / "holders"
+        if not holders_path.exists():
+            return []
+        return sorted(h.name for h in holders_path.iterdir() if h.is_dir())
+    
     def _read_slaves(self, path: Path) -> List[str]:
         slaves_path = path / "slaves"
         if not slaves_path.exists():
@@ -147,49 +154,46 @@ class BlockDeviceScanner:
         return sorted(s.name for s in slaves_path.iterdir() if s.is_dir())
     
     def _read_partition_label(self, path: Path) -> str:
-        label_path = path / "label"
-        if label_path.exists():
-            return self._read_text(label_path)
+        try:
+            blkid_path = Path("/dev/disk/by-partlabel")
+            if blkid_path.exists():
+                for link in blkid_path.iterdir():
+                    if link.is_symlink() and link.resolve().name == path.name:
+                        return link.name
+        except OSError:
+            pass
         return ""
     
     def _read_partition_uuid(self, path: Path) -> str:
-        uuid_path = path / "uuid"
-        if uuid_path.exists():
-            return self._read_text(uuid_path)
+        try:
+            blkid_path = Path("/dev/disk/by-partuuid")
+            if blkid_path.exists():
+                for link in blkid_path.iterdir():
+                    if link.is_symlink() and link.resolve().name == path.name:
+                        return link.name
+        except OSError:
+            pass
         return ""
     
     def _build_relationships(self, devices: Dict[str, Device]) -> None:
-        parent_lookup: Dict[str, str] = {}
-        
         for dev in devices.values():
-            for slave in dev.slaves:
-                if slave in devices:
-                    parent_lookup[dev.name] = slave
+            for holder in dev.holders:
+                if holder in devices:
+                    dev.parent = holder
+                    devices[holder].children.append(dev)
                     break
         
-        part_parents = self._find_partition_parents(devices)
-        parent_lookup.update(part_parents)
-        
-        for dev_name, parent_name in parent_lookup.items():
-            if dev_name in devices and parent_name in devices:
-                devices[dev_name].parent = parent_name
-                devices[parent_name].children.append(devices[dev_name])
+        for dev in devices.values():
+            if dev.type == "part" and not dev.parent:
+                for parent in devices.values():
+                    parent_path = SYS_BLOCK / parent.name
+                    if (parent_path / dev.name).exists():
+                        dev.parent = parent.name
+                        devices[parent.name].children.append(dev)
+                        break
         
         for dev in devices.values():
             dev.children.sort(key=lambda d: d.name)
-    
-    def _find_partition_parents(self, devices: Dict[str, Device]) -> Dict[str, str]:
-        parent_map: Dict[str, str] = {}
-        path_to_parent: Dict[str, str] = {}
-        
-        for parent_name in devices:
-            parent_path = SYS_BLOCK / parent_name
-            for child_path in parent_path.iterdir():
-                if child_path.is_dir() and child_path.name in devices:
-                    if devices[child_path.name].type == "part":
-                        parent_map[child_path.name] = parent_name
-        
-        return parent_map
 
 
 class MountScanner:
@@ -317,7 +321,14 @@ class JsonFormatter:
 
 class SimpleFormatter:
     def format(self, devices: List[Device]) -> List[str]:
-        return [f"/dev/{d.name}" for d in devices]
+        result = []
+        def collect_all(dev: Device):
+            result.append(f"/dev/{dev.name}")
+            for child in dev.children:
+                collect_all(child)
+        for dev in devices:
+            collect_all(dev)
+        return result
 
 
 def filter_devices(devices: List[Device], predicate: Callable[[Device], bool]) -> List[Device]:
@@ -387,11 +398,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretty", action="store_true", help="Pretty print JSON")
     parser.add_argument("--min", "--min-size", type=str, dest="min_size", help="Minimum size (e.g., 1G, 500M)")
     parser.add_argument("--type", action="append", dest="types", help="Filter by type (disk, part, dm, raid)")
-    parser.add_argument("--exclude", action="append", default=["loop", "ram"], help="Exclude devices by prefix")
+    parser.add_argument("--exclude", action="append", help="Exclude devices by prefix")
     parser.add_argument("--width", type=int, default=24, help="Name column width")
     parser.add_argument("--no-headers", action="store_true", help="Suppress headers")
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.exclude is None:
+        args.exclude = ["loop", "ram"]
+    return args
 
 
 def print_headers(width: int) -> None:
