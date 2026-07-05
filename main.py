@@ -123,12 +123,20 @@ class BlockDeviceScanner:
             return "dm"
         if (path / "md").exists():
             return "raid"
+        if (path / "loop").exists():
+            return "loop"
         return "disk"
     
     def _read_text(self, path: Path, default: str = "") -> str:
         try:
             return path.read_text().strip()
-        except (FileNotFoundError, PermissionError, OSError):
+        except FileNotFoundError:
+            return default
+        except PermissionError:
+            print(f"Warning: Permission denied reading {path}", file=sys.stderr)
+            return default
+        except OSError as e:
+            print(f"Warning: Error reading {path}: {e}", file=sys.stderr)
             return default
     
     def _read_int(self, path: Path, default: int = 0) -> int:
@@ -145,21 +153,31 @@ class BlockDeviceScanner:
         holders_path = path / "holders"
         if not holders_path.exists():
             return []
-        return sorted(h.name for h in holders_path.iterdir() if h.is_dir())
+        try:
+            return sorted(h.name for h in holders_path.iterdir() if h.is_dir())
+        except OSError:
+            return []
     
     def _read_slaves(self, path: Path) -> List[str]:
         slaves_path = path / "slaves"
         if not slaves_path.exists():
             return []
-        return sorted(s.name for s in slaves_path.iterdir() if s.is_dir())
+        try:
+            return sorted(s.name for s in slaves_path.iterdir() if s.is_dir())
+        except OSError:
+            return []
     
     def _read_partition_label(self, path: Path) -> str:
         try:
             blkid_path = Path("/dev/disk/by-partlabel")
             if blkid_path.exists():
                 for link in blkid_path.iterdir():
-                    if link.is_symlink() and link.resolve().name == path.name:
-                        return link.name
+                    if link.is_symlink():
+                        try:
+                            if link.resolve().name == path.name:
+                                return link.name
+                        except OSError:
+                            continue
         except OSError:
             pass
         return ""
@@ -169,8 +187,12 @@ class BlockDeviceScanner:
             blkid_path = Path("/dev/disk/by-partuuid")
             if blkid_path.exists():
                 for link in blkid_path.iterdir():
-                    if link.is_symlink() and link.resolve().name == path.name:
-                        return link.name
+                    if link.is_symlink():
+                        try:
+                            if link.resolve().name == path.name:
+                                return link.name
+                        except OSError:
+                            continue
         except OSError:
             pass
         return ""
@@ -211,6 +233,9 @@ class MountScanner:
                     parts = line.split()
                     if len(parts) >= 2:
                         device = self._resolve_device(parts[0])
+                        mount_options = []
+                        if len(parts) >= 4:
+                            mount_options = parts[3].split(",")
                         self._mounts.setdefault(device, []).append(parts[1])
         except OSError:
             pass
@@ -237,6 +262,7 @@ class TreeFormatter:
     def __init__(self, mounts: Dict[str, List[str]], width: int = 24):
         self.mounts = mounts
         self.width = width
+        self._device_cache: Dict[str, str] = {}
     
     def format(self, devices: List[Device], prefix: str = "") -> List[str]:
         lines = []
@@ -269,19 +295,29 @@ class TreeFormatter:
         ).rstrip()
     
     def _get_mount(self, name: str) -> str:
+        if name in self._device_cache:
+            return self._device_cache[name]
+        
         dev_path = Path("/dev") / name
         try:
-            resolved = str(dev_path.resolve())
-            if resolved in self.mounts:
-                return self.mounts[resolved][0]
+            if dev_path.exists():
+                resolved = str(dev_path.resolve())
+                if resolved in self.mounts:
+                    result = self.mounts[resolved][0]
+                    self._device_cache[name] = result
+                    return result
         except OSError:
             pass
-        return self.mounts.get(f"/dev/{name}", [""])[0]
+        
+        result = self.mounts.get(f"/dev/{name}", [""])[0]
+        self._device_cache[name] = result
+        return result
 
 
 class JsonFormatter:
     def __init__(self, mounts: Dict[str, List[str]]):
         self.mounts = mounts
+        self._device_cache: Dict[str, List[str]] = {}
     
     def format(self, devices: List[Device], pretty: bool = False) -> str:
         data = [self._device_to_dict(d) for d in devices]
@@ -309,14 +345,23 @@ class JsonFormatter:
         return result
     
     def _get_mounts(self, name: str) -> List[str]:
+        if name in self._device_cache:
+            return self._device_cache[name]
+        
         dev_path = Path("/dev") / name
         try:
-            resolved = str(dev_path.resolve())
-            if resolved in self.mounts:
-                return self.mounts[resolved]
+            if dev_path.exists():
+                resolved = str(dev_path.resolve())
+                if resolved in self.mounts:
+                    result = self.mounts[resolved]
+                    self._device_cache[name] = result
+                    return result
         except OSError:
             pass
-        return self.mounts.get(f"/dev/{name}", [])
+        
+        result = self.mounts.get(f"/dev/{name}", [])
+        self._device_cache[name] = result
+        return result
 
 
 class SimpleFormatter:
@@ -331,10 +376,58 @@ class SimpleFormatter:
         return result
 
 
+class YAMLFormatter:
+    def __init__(self, mounts: Dict[str, List[str]]):
+        self.mounts = mounts
+    
+    def format(self, devices: List[Device]) -> str:
+        import yaml
+        data = [self._device_to_dict(d) for d in devices]
+        return yaml.dump(data, default_flow_style=False, sort_keys=False)
+    
+    def _device_to_dict(self, dev: Device) -> Dict[str, Any]:
+        result = {
+            "name": dev.name,
+            "size": dev.size,
+            "size_human": dev.size_human,
+            "type": dev.type,
+            "read_only": dev.ro,
+            "removable": dev.rm,
+            "mountpoints": self._get_mounts(dev.name),
+        }
+        if dev.model:
+            result["model"] = dev.model
+        if dev.label:
+            result["label"] = dev.label
+        if dev.uuid:
+            result["uuid"] = dev.uuid
+        if dev.children:
+            result["children"] = [self._device_to_dict(c) for c in dev.children]
+        return result
+    
+    def _get_mounts(self, name: str) -> List[str]:
+        dev_path = Path("/dev") / name
+        try:
+            if dev_path.exists():
+                resolved = str(dev_path.resolve())
+                if resolved in self.mounts:
+                    return self.mounts[resolved]
+        except OSError:
+            pass
+        return self.mounts.get(f"/dev/{name}", [])
+
+
 def filter_devices(devices: List[Device], predicate: Callable[[Device], bool]) -> List[Device]:
     def filter_device(dev: Device) -> Optional[Device]:
         if predicate(dev):
-            return dev.copy()
+            filtered_dev = dev.copy()
+            filtered_children = []
+            for child in dev.children:
+                filtered_child = filter_device(child)
+                if filtered_child:
+                    filtered_children.append(filtered_child)
+            filtered_dev.children = filtered_children
+            return filtered_dev
         
         filtered_children = []
         for child in dev.children:
@@ -394,6 +487,7 @@ def parse_args() -> argparse.Namespace:
     )
     
     parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--yaml", action="store_true", help="YAML output")
     parser.add_argument("--simple", action="store_true", help="Simple output (device paths only)")
     parser.add_argument("--pretty", action="store_true", help="Pretty print JSON")
     parser.add_argument("--min", "--min-size", type=str, dest="min_size", help="Minimum size (e.g., 1G, 500M)")
@@ -403,6 +497,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-headers", action="store_true", help="Suppress headers")
     
     args = parser.parse_args()
+    
+    if args.json and args.yaml:
+        parser.error("--json and --yaml cannot be used together")
+    if args.json and args.simple:
+        parser.error("--json and --simple cannot be used together")
+    if args.yaml and args.simple:
+        parser.error("--yaml and --simple cannot be used together")
+    if args.json and args.no_headers:
+        parser.error("--json and --no-headers cannot be used together")
+    if args.yaml and args.no_headers:
+        parser.error("--yaml and --no-headers cannot be used together")
+    
     if args.exclude is None:
         args.exclude = ["loop", "ram"]
     return args
@@ -441,6 +547,15 @@ def main() -> int:
     if args.json:
         formatter = JsonFormatter(mounts)
         print(formatter.format(roots, pretty=args.pretty))
+        return 0
+    
+    if args.yaml:
+        try:
+            formatter = YAMLFormatter(mounts)
+            print(formatter.format(roots))
+        except ImportError:
+            print("Error: PyYAML is required for YAML output", file=sys.stderr)
+            return 1
         return 0
     
     if args.simple:
